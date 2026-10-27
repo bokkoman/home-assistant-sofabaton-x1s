@@ -915,13 +915,235 @@ def _encode_wifi_mqtt(decoded: Dict[str, Any]) -> bytes:
     )
 
 
+# ---- wifi_ip URL-string variant (class 0x1C, app-defined commands) --------
+#
+# Commands defined through the Sofabaton phone app's "IP control" screen
+# are stored by the hub in a different wire layout than the Host/HTTP-text
+# form that _decode_wifi_ip handles. This variant is a length-prefixed
+# request descriptor, not a raw HTTP/1.1 text block:
+#
+#   u16 total_length    (counts the whole blob, including these 2 bytes)
+#   u16 url_length ; url (ASCII, e.g. "http://192.168.1.161:8080/jsonrpc")
+#   u8  method_code     (0x01 = POST, confirmed; 0x00 = GET, inferred)
+#   u8  header_count
+#     per header:
+#       u8  name_length  ; name  (ASCII)
+#       u16 value_length ; value (ASCII)
+#   bytes body          (remainder, to the end of the blob)
+#
+# There is no trailer and no checksum: total_length covers everything.
+#
+# To reuse the existing wifi_ip editor form unchanged, the decoder maps
+# this onto the SAME field names (host, port, method, path, header,
+# content_type, body). Every header, including Content-Type, goes into
+# the free-form `header` field in its original order so the bytes
+# round-trip exactly; `content_type` is left empty for this variant.
+# Two non-UI carry keys let the encoder reproduce the bytes and are
+# ignored by the form:
+#     _ip_variant = "url"    selects this encoder on save
+#     _url_scheme = "http"   the scheme the host/port/path split drops
+#
+# Only GET/POST are mapped (the app offers only those). Any other method
+# code decodes to None via the round-trip guard in try_decode_blob, so a
+# command is never silently re-encoded into the wrong bytes.
+
+_WIFI_IP_URL_METHOD_BY_CODE: Dict[int, str] = {0x00: "GET", 0x01: "POST"}
+_WIFI_IP_URL_METHOD_BY_NAME: Dict[str, int] = {
+    name: code for code, name in _WIFI_IP_URL_METHOD_BY_CODE.items()
+}
+
+
+def _wifi_ip_url_ascii(chunk: bytes, what: str) -> str:
+    try:
+        return chunk.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"wifi_ip(url) {what} region is not ASCII") from exc
+
+
+def _split_http_url(url: str) -> Tuple[str, str, int, str]:
+    """Split "scheme://host:port/path" into (scheme, host, port, path).
+
+    Raises ValueError for anything this variant does not represent
+    (missing scheme, missing explicit port, non-numeric port). A raise
+    here just means the blob stays raw — never a wrong re-encode.
+    """
+
+    scheme_sep = url.find("://")
+    if scheme_sep <= 0:
+        raise ValueError(f"wifi_ip(url) URL has no scheme: {url!r}")
+    scheme = url[:scheme_sep]
+    rest = url[scheme_sep + 3 :]
+    slash = rest.find("/")
+    authority = rest if slash < 0 else rest[:slash]
+    path = "" if slash < 0 else rest[slash:]
+    colon = authority.rfind(":")
+    if colon < 0:
+        raise ValueError(f"wifi_ip(url) authority has no explicit port: {url!r}")
+    host = authority[:colon]
+    port_text = authority[colon + 1 :]
+    if not host or not port_text.isdigit():
+        raise ValueError(f"wifi_ip(url) authority malformed: {url!r}")
+    return scheme, host, int(port_text), path
+
+
+def _wifi_ip_url_header_lines(header: str, content_type: str) -> list[Tuple[str, str]]:
+    """Rebuild the ordered (name, value) list from the editor fields.
+
+    Lines are "Name:Value", split on the FIRST colon so values that
+    themselves contain colons survive. A non-empty content_type (only
+    possible after a user edit — the decoder leaves it empty) is appended
+    as a trailing Content-Type header.
+    """
+
+    pairs: list[Tuple[str, str]] = []
+    for line in (header or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line:
+            continue
+        name, sep, value = line.partition(":")
+        if not sep:
+            raise ValueError(f"wifi_ip(url) header line has no colon: {line!r}")
+        pairs.append((name, value))
+    if content_type:
+        pairs.append(("Content-Type", content_type))
+    return pairs
+
+
+def _decode_wifi_ip_url(data: bytes) -> Dict[str, Any]:
+    if len(data) < 6:
+        raise ValueError("wifi_ip(url) blob too short for header")
+    total = int.from_bytes(data[0:2], "big")
+    if total != len(data):
+        raise ValueError(
+            f"wifi_ip(url) length prefix {total} != blob size {len(data)}"
+        )
+    off = 2
+    url_len = int.from_bytes(data[off : off + 2], "big")
+    off += 2
+    if off + url_len + 2 > len(data):
+        raise ValueError("wifi_ip(url) URL runs past end of blob")
+    url = _wifi_ip_url_ascii(data[off : off + url_len], "URL")
+    off += url_len
+    method_code = data[off]
+    header_count = data[off + 1]
+    off += 2
+    if method_code not in _WIFI_IP_URL_METHOD_BY_CODE:
+        raise ValueError(f"wifi_ip(url) unmapped method code: {method_code:#04x}")
+    headers: list[Tuple[str, str]] = []
+    for _ in range(header_count):
+        if off + 1 > len(data):
+            raise ValueError("wifi_ip(url) truncated header name length")
+        name_len = data[off]
+        off += 1
+        if off + name_len + 2 > len(data):
+            raise ValueError("wifi_ip(url) truncated header name/value length")
+        name = _wifi_ip_url_ascii(data[off : off + name_len], "header name")
+        off += name_len
+        value_len = int.from_bytes(data[off : off + 2], "big")
+        off += 2
+        if off + value_len > len(data):
+            raise ValueError("wifi_ip(url) header value runs past end of blob")
+        value = _wifi_ip_url_ascii(data[off : off + value_len], "header value")
+        off += value_len
+        headers.append((name, value))
+    body = _wifi_ip_url_ascii(data[off:], "body")
+
+    scheme, host, port, path = _split_http_url(url)
+
+    # Match the native decoder's field convention: pull Content-Type into
+    # its own field and keep everything else in the free-form `header`
+    # blob. The encoder re-emits Content-Type last, so a command whose
+    # Content-Type was the final header (the shape the app writes) round-
+    # trips exactly; any other ordering fails the round-trip guard in
+    # try_decode_blob and the row safely stays raw.
+    content_type = ""
+    extra: list[Tuple[str, str]] = []
+    for name, value in headers:
+        if content_type == "" and name.lower() == "content-type":
+            content_type = value
+        else:
+            extra.append((name, value))
+    header_field = "\r\n".join("{0}:{1}".format(name, value) for name, value in extra)
+    return {
+        "host": host,
+        "port": port,
+        "method": _WIFI_IP_URL_METHOD_BY_CODE[method_code],
+        "path": path,
+        "header": header_field,
+        "content_type": content_type,
+        "body": body,
+        "_ip_variant": "url",
+        "_url_scheme": scheme,
+        "trailer_hex": "",
+    }
+
+
+def _encode_wifi_ip_url(decoded: Dict[str, Any]) -> bytes:
+    scheme = str(decoded.get("_url_scheme") or "http")
+    host = str(decoded["host"])
+    port = int(decoded["port"])
+    if port < 0 or port > 0xFFFF:
+        raise ValueError(f"wifi_ip(url) port out of range: {port}")
+    path = str(decoded.get("path") or "")
+    url = "{0}://{1}:{2}{3}".format(scheme, host, port, path)
+
+    method = str(decoded.get("method") or "").upper()
+    if method not in _WIFI_IP_URL_METHOD_BY_NAME:
+        raise ValueError(f"wifi_ip(url) unmapped method: {method!r}")
+    method_code = _WIFI_IP_URL_METHOD_BY_NAME[method]
+
+    headers = _wifi_ip_url_header_lines(
+        str(decoded.get("header") or ""), str(decoded.get("content_type") or "")
+    )
+    if len(headers) > 0xFF:
+        raise ValueError("wifi_ip(url) too many headers")
+    body = str(decoded.get("body") or "")
+
+    out = bytearray()
+    url_bytes = url.encode("ascii")
+    out += len(url_bytes).to_bytes(2, "big")
+    out += url_bytes
+    out += bytes([method_code, len(headers)])
+    for name, value in headers:
+        name_bytes = name.encode("ascii")
+        value_bytes = value.encode("ascii")
+        if len(name_bytes) > 0xFF:
+            raise ValueError(f"wifi_ip(url) header name too long: {name!r}")
+        if len(value_bytes) > 0xFFFF:
+            raise ValueError(f"wifi_ip(url) header value too long: {name!r}")
+        out += bytes([len(name_bytes)])
+        out += name_bytes
+        out += len(value_bytes).to_bytes(2, "big")
+        out += value_bytes
+    out += body.encode("ascii")
+    return (len(out) + 2).to_bytes(2, "big") + bytes(out)
+
+
+def _decode_wifi_ip_any(data: bytes) -> Dict[str, Any]:
+    """Decode a wifi_ip blob in either the Host/HTTP-text or URL-string form.
+
+    The native Host/HTTP-text decoder is tried first; its ValueError on a
+    non-matching blob is the signal to try the app's URL-string variant.
+    """
+
+    try:
+        return _decode_wifi_ip(data)
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return _decode_wifi_ip_url(data)
+
+
+def _encode_wifi_ip_any(decoded: Dict[str, Any]) -> bytes:
+    if str(decoded.get("_ip_variant") or "") == "url":
+        return _encode_wifi_ip_url(decoded)
+    return _encode_wifi_ip(decoded)
+
+
 # ---------------------------------------------------------------------------
 # Registry + high-level entry points
 # ---------------------------------------------------------------------------
 
 
 _DECODERS: Dict[str, Callable[[bytes], Dict[str, Any]]] = {
-    DEVICE_CLASS_WIFI_IP: _decode_wifi_ip,
+    DEVICE_CLASS_WIFI_IP: _decode_wifi_ip_any,
     DEVICE_CLASS_WIFI_ROKU: _decode_wifi_roku,
     DEVICE_CLASS_WIFI_HUE: _decode_wifi_hue_like,
     DEVICE_CLASS_WIFI_SONOS: _decode_wifi_hue_like,
@@ -930,7 +1152,7 @@ _DECODERS: Dict[str, Callable[[bytes], Dict[str, Any]]] = {
 }
 
 _ENCODERS: Dict[str, Callable[[Dict[str, Any]], bytes]] = {
-    DEVICE_CLASS_WIFI_IP: _encode_wifi_ip,
+    DEVICE_CLASS_WIFI_IP: _encode_wifi_ip_any,
     DEVICE_CLASS_WIFI_ROKU: _encode_wifi_roku,
     DEVICE_CLASS_WIFI_HUE: _encode_wifi_hue_like,
     DEVICE_CLASS_WIFI_SONOS: _encode_wifi_hue_like,
