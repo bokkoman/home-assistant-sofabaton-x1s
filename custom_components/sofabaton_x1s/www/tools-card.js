@@ -9894,6 +9894,12 @@ var BACKUP_BUNDLE_SCHEMA_VERSION = 5;
 // custom_components/sofabaton_x1s/www/src/shared/wifi-ip-form.ts
 var WIFI_IP_SCHEMES = ["http", "https"];
 var WIFI_IP_URL_METHODS = ["GET", "POST", "PUT"];
+var WIFI_IP_FORM_METHODS = ["POST", "GET", "PUT"];
+var WIFI_IP_CONTENT_TYPES = [
+  "",
+  "application/json",
+  "application/x-www-form-urlencoded"
+];
 var WIFI_IP_DRAFT_KEYS = [
   "scheme",
   "host",
@@ -10159,6 +10165,8 @@ function decodedFormFields(className, isX2) {
     ...fields.map((field) => {
       if (field.key === "host") return { ...field, label: S5.host, helper: S5.hostOrNameExample };
       if (field.key === "port") return { ...field, helper: S5.portDefaultHelper };
+      if (field.key === "method") return { ...field, helper: void 0, options: WIFI_IP_FORM_METHODS };
+      if (field.key === "content_type") return { ...field, options: WIFI_IP_CONTENT_TYPES };
       return field;
     })
   ];
@@ -14669,13 +14677,14 @@ var PayloadDialogController = class {
   renderDecodedField(field) {
     const value = this.decodedDrafts[field.key] ?? "";
     const onInput = (event) => this.handleDecodedFieldInput(event, field.key);
+    const options = field.options && !field.options.includes(value) ? [value, ...field.options] : field.options;
     const multilineClass = field.escapedDisplay ? "decoded-field-input--multiline decoded-field-input--escaped" : "decoded-field-input--multiline";
     return b2`
       <label class="decoded-field">
         <span class="decoded-field-label">${field.label}</span>
-        ${field.options ? b2`
+        ${options ? b2`
               <select class="decoded-field-input" @change=${onInput}>
-                ${field.options.map((option) => b2`<option value=${option} ?selected=${option === value}>${option}</option>`)}
+                ${options.map((option) => b2`<option value=${option} ?selected=${option === value}>${option || TOOLS_CARD_STRINGS.wifiCommands.none}</option>`)}
               </select>
             ` : field.multiline ? b2`
               <textarea
